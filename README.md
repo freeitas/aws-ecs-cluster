@@ -1,3 +1,25 @@
+## Architecture decisions
+
+### Why EC2 capacity providers and not Fargate here
+
+I run this cluster on `c6a.large` nodes behind two ASG-backed capacity providers because I want packing density: many small tasks sharing one billed host, with the node's spare headroom absorbing bursts instead of being re-billed per task. Fargate would delete `launch_template.tf`, `templates/user-data.tpl` and `iam_instance_profile.tf` — and with them the AMI choice, the 50 GiB gp3 root volume and the `ECS_CLUSTER` line that registers each node. Fargate Spot exists, but it is priced and reclaimed per task, not per node — a different trade from `asg_spots.tf`.
+
+### Spot capacity is registered, but never the default
+
+`ecs.tf` attaches both capacity providers to the cluster, yet `default_capacity_provider_strategy` names only on-demand, at weight 100 / base 0. Spot nodes exist and a service has to ask for them by name. I rejected a mixed default strategy (base on-demand + weighted spot): with it, every service deployed here — including ones that cannot drain inside the two-minute interruption notice — silently lands on reclaimable capacity, and the failure only surfaces the first time AWS takes a node back. The `max_price = "0.30"` ceiling in `launch_template_spots.tf` sits well above the `c6a.large` on-demand rate on purpose: interruptions should come from capacity reclaim, never from being outbid.
+
+### ECS managed scaling moves `desired_capacity`, not my plans
+
+Terraform seeds `desired_capacity` on both ASGs and then stops looking: each carries `ignore_changes = [desired_capacity]`, and each capacity provider runs managed scaling at `target_capacity = 90`. Terraform keeps floor and ceiling; the ECS scaler picks the number between them. The alternative — leaving `desired_capacity` under Terraform's control, or attaching a CPU target-tracking policy — means every `plan` reports drift against whatever the scaler did minutes earlier, and an apply terminates instances out from under placed tasks.
+
+### SSM Parameter Store as the cross-stack contract, not remote state
+
+`data.tf` reads the VPC and all six subnet ids from `/aws-vpc/vpc/*`; `parameters.tf` writes the ALB ARN and listener ARN back under `/aws/ecs/lb/`. Consumers read two strings by name. With `terraform_remote_state` instead, every service stack would need read access to the whole state object in `aws-containers-statefiles` — every attribute of every resource here — and any rename would break their plan.
+
+### One shared ALB lives with the cluster, not with the services
+
+`load_balancer.tf` creates the ALB and an HTTP :80 listener whose default action is a fixed 200 response: a deliberate placeholder, so service stacks attach their own target groups and rules to the listener ARN published in SSM. An ALB per service would mean a separate hourly floor and DNS name each. What I accept in exchange: services share one listener-rule priority space, and destroying this stack takes every service's ingress with it.
+
 ## Requirements
 
 No requirements.
